@@ -273,13 +273,19 @@ if ("speechSynthesis" in window){ pickVoice(); speechSynthesis.onvoiceschanged =
 function speak(text, {rate=0.85, pitch=1.15}={}){
   return new Promise(res=>{
     if(!("speechSynthesis" in window)) return res();
+    let done = false;
+    const finish = () => { if(!done){ done = true; clearTimeout(watchdog); res(); } };
+    // Watchdog: some phones never fire onend — never let the game freeze waiting.
+    const watchdog = setTimeout(finish, 1500 + text.length * 130);
     const u = new SpeechSynthesisUtterance(text);
     if (voice) u.voice = voice;
     u.rate = rate; u.pitch = pitch;
-    u.onend = res; u.onerror = res;
+    u.onend = finish; u.onerror = finish;
     speechSynthesis.speak(u);
   });
 }
+// Chrome quietly pauses long speech; nudge it back awake.
+setInterval(()=>{ try{ if (speechSynthesis.speaking && !speechSynthesis.paused) speechSynthesis.resume(); }catch(e){} }, 4000);
 function stopSpeak(){ try{ speechSynthesis.cancel(); }catch(e){} }
 async function sayLetterSound(l){ await speak(LETTERS[l].snd, {rate:0.75}); }
 
@@ -459,7 +465,7 @@ async function lessonMeet(){
     <div class="screen">
       ${lessonTop()}
       <div class="letter-stage">
-        <div class="giant-letter pop" id="bigL">${L.letter}</div>
+        <div class="giant-letter pop" id="bigL" style="font-size:120px">${L.letter.toUpperCase()} ${L.letter}</div>
         <div class="keyword-emoji bounce">${d.ke}</div>
         <h2>${L.letter} · ${d.kw}</h2>
         <button class="iconbtn" style="width:72px;height:72px;font-size:34px" onclick="meetSay()">🔊</button>
@@ -477,14 +483,16 @@ async function meetSay(){
   await sayLetterSound(L.letter);
 }
 
-/* Step 2: trace while saying the sound */
-function lessonTrace(){
-  L.step = 1;
+/* Step 2: trace while saying the sound — big letter first, then small */
+function lessonTrace(caseStep=0){
+  L.step = 1; L.caseStep = caseStep;
+  const glyph = caseStep===0 ? L.letter.toUpperCase() : L.letter;
+  const label = caseStep===0 ? "BIG" : "little";
   render(`
     <div class="screen">
       ${lessonTop()}
-      <h2>Trace the ${L.letter} with your finger!</h2>
-      <p class="subtitle">Say <b>${LETTERS[L.letter].snd.replace(/,/g,"")}</b> while you trace! 🗣️</p>
+      <h2>Trace the ${label} ${glyph}!</h2>
+      <p class="subtitle">${caseStep===0?"1":"2"} of 2 · Say <b>${LETTERS[L.letter].snd.replace(/,/g,"")}</b> while you trace! 🗣️</p>
       <div id="traceWrap"><canvas id="traceCanvas"></canvas></div>
       <div style="display:flex; gap:10px; align-items:center; margin-top:10px">
         <button class="iconbtn" onclick="sayLetterSound(L.letter)">🔊</button>
@@ -492,13 +500,18 @@ function lessonTrace(){
         <button class="bigbtn" style="margin:0" onclick="checkTrace()">Done! ✅</button>
       </div>
     </div>`);
-  speak("Trace the letter with your finger, and say its sound while you trace!");
-  setupTrace();
+  speak(caseStep===0
+    ? "First trace the big " + L.letter + " with your finger. Say its sound while you trace!"
+    : "Now trace the little " + L.letter + "!");
+  // Wait for layout before measuring, or the board comes out broken.
+  requestAnimationFrame(()=>setupTrace());
 }
 let TR = null;
 function setupTrace(){
   const wrap = document.getElementById("traceWrap"), cv = document.getElementById("traceCanvas");
+  if (!wrap || !cv) return;
   const size = wrap.clientWidth;
+  if (!size){ setTimeout(setupTrace, 120); return; }
   const dpr = window.devicePixelRatio || 1;
   cv.width = size * dpr; cv.height = size * dpr;
   cv.style.width = size + "px"; cv.style.height = size + "px";
@@ -506,21 +519,34 @@ function setupTrace(){
   ctx.setTransform(dpr,0,0,dpr,0,0);
   ctx.clearRect(0,0,size,size);
   // letter stencil
-  ctx.font = `500 ${size*0.72}px "Chalkboard SE","Comic Sans MS",sans-serif`;
+  const glyph = (L.caseStep===0 ? L.letter.toUpperCase() : L.letter);
+  const fsize = size * (L.caseStep===0 ? 0.62 : 0.72);
+  ctx.font = `500 ${fsize}px "Chalkboard SE","Comic Sans MS",sans-serif`;
   ctx.textAlign = "center"; ctx.textBaseline = "middle";
   ctx.fillStyle = "#eadcfa";
-  ctx.fillText(L.letter, size/2, size/2 + size*0.04);
+  ctx.fillText(glyph, size/2, size/2 + size*0.04);
   ctx.setLineDash([8,8]); ctx.strokeStyle = "#a86ee0"; ctx.lineWidth = 3;
-  ctx.strokeText(L.letter, size/2, size/2 + size*0.04);
+  ctx.strokeText(glyph, size/2, size/2 + size*0.04);
   ctx.setLineDash([]);
-  // mask of letter pixels for scoring
+  // green start dot at the letter's top-left ink, so she knows where to begin
+  // mask of letter pixels for scoring (fatter weight = forgiving)
   const mctx = document.createElement("canvas").getContext("2d");
   mctx.canvas.width = size; mctx.canvas.height = size;
-  mctx.font = `800 ${size*0.72}px "Chalkboard SE","Comic Sans MS",sans-serif`; mctx.textAlign="center"; mctx.textBaseline="middle";
-  mctx.fillText(L.letter, size/2, size/2 + size*0.04);
+  mctx.font = `800 ${fsize}px "Chalkboard SE","Comic Sans MS",sans-serif`; mctx.textAlign="center"; mctx.textBaseline="middle";
+  mctx.fillText(glyph, size/2, size/2 + size*0.04);
   const mask = mctx.getImageData(0,0,size,size).data;
   TR = { ctx, size, mask, hits:new Set(), inkTotal:0, maskCount:0 };
-  for(let i=3;i<mask.length;i+=4) if(mask[i]>40) TR.maskCount++;
+  let startPt = null;
+  for(let y=0;y<size;y++) for(let x=0;x<size;x++){
+    const i2 = (y*size+x)*4+3;
+    if (mask[i2]>40){ TR.maskCount++; if(!startPt) startPt = {x,y}; }
+  }
+  // green start dot near where the letter begins
+  if (startPt){
+    ctx.beginPath(); ctx.arc(startPt.x, startPt.y+6, 10, 0, Math.PI*2);
+    ctx.fillStyle = "#3fbf6a"; ctx.fill();
+    ctx.lineWidth = 3; ctx.strokeStyle = "#fff"; ctx.stroke();
+  }
   let drawing = false, last = null;
   const pos = e => {
     const r = cv.getBoundingClientRect();
@@ -549,15 +575,21 @@ function setupTrace(){
   cv.ontouchstart = start; cv.ontouchmove = move; cv.ontouchend = end;
 }
 async function checkTrace(){
+  if (!TR || !TR.maskCount){ setupTrace(); return; }
   const coverage = TR.hits.size * 40;  // rough: each hit "covers" a blob of mask pixels
-  const enough = TR.inkTotal > 40 && coverage > TR.maskCount * 0.25;
+  const enough = TR.inkTotal > 40 && coverage > TR.maskCount * 0.18;
   if (enough){
     chime(true); confetti(14);
-    await speak("Beautiful tracing! " + LETTERS[L.letter].snd, {pitch:1.25});
-    lessonFind();
+    if (L.caseStep === 0){
+      await speak("Beautiful! Now the little one!", {pitch:1.25});
+      lessonTrace(1);
+    } else {
+      await speak("Beautiful tracing! " + LETTERS[L.letter].snd, {pitch:1.25});
+      lessonFind();
+    }
   } else {
     chime(false);
-    await speak("Trace the big letter with your finger first! Say " + LETTERS[L.letter].snd + " while you trace!");
+    await speak("Trace the letter with your finger first! Start at the green dot, and say " + LETTERS[L.letter].snd + " while you trace!");
   }
 }
 
